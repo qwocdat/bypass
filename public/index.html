@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>link-bypass — resolver console</title>
+<style>
+  :root{
+    --ink: #10131a;
+    --panel: #171b24;
+    --border: #262b36;
+    --text: #e8eaf0;
+    --muted: #7c8494;
+    --amber: #f5a623;
+    --amber-dim: #7a5619;
+    --teal: #2dd4bf;
+    --danger: #e05c5c;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  *{ box-sizing: border-box; }
+  body{
+    margin: 0;
+    min-height: 100vh;
+    background: var(--ink);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+  }
+  .console{
+    width: 100%;
+    max-width: 640px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .titlebar{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .dot{ width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+  .titlebar span.path{ margin-left: 4px; }
+  .titlebar .hosts{ margin-left: auto; font-size: 12px; }
+
+  .input-row{
+    display: flex;
+    gap: 8px;
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .input-row input{
+    flex: 1;
+    background: var(--ink);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 14px;
+    padding: 10px 12px;
+  }
+  .input-row input:focus{ outline: 1px solid var(--amber); }
+  .input-row input::placeholder{ color: var(--muted); }
+
+  button{
+    font-family: var(--mono);
+    font-size: 14px;
+    border-radius: 6px;
+    border: 1px solid var(--amber-dim);
+    background: transparent;
+    color: var(--amber);
+    padding: 10px 16px;
+    cursor: pointer;
+  }
+  button:hover{ background: rgba(245,166,35,0.08); }
+  button:disabled{ opacity: 0.5; cursor: default; }
+  button:focus-visible{ outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  .trace{
+    padding: 14px 16px;
+    min-height: 64px;
+    max-height: 260px;
+    overflow-y: auto;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  .trace .hop{ display: flex; gap: 10px; }
+  .trace .hop .n{ color: var(--amber); width: 18px; flex-shrink: 0; text-align: right; }
+  .trace .hop.error .n{ color: var(--danger); }
+  .trace .empty{ color: var(--muted); }
+
+  .result{
+    padding: 16px;
+    border-top: 1px solid var(--border);
+  }
+  .result .label{ color: var(--muted); margin-bottom: 6px; }
+  .result .dest-row{ display: flex; gap: 8px; align-items: center; }
+  .result .dest{
+    flex: 1;
+    color: var(--teal);
+    word-break: break-all;
+    background: var(--ink);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .result.error .label{ color: var(--danger); }
+  .result.hidden{ display: none; }
+
+  .copy-btn{ border-color: #1f4c47; color: var(--teal); }
+  .copy-btn:hover{ background: rgba(45,212,191,0.08); }
+
+  @media (prefers-reduced-motion: no-preference){
+    .console{ animation: rise 0.25s ease-out; }
+  }
+  @keyframes rise{ from{ opacity: 0; transform: translateY(4px); } to{ opacity: 1; transform: translateY(0); } }
+</style>
+</head>
+<body>
+  <main class="console">
+    <div class="titlebar">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="path">link-bypass</span>
+      <span class="hosts" id="hosts-label"></span>
+    </div>
+
+    <form class="input-row" id="form">
+      <input
+        type="url"
+        id="url-input"
+        placeholder="https://link4m.com/..."
+        autocomplete="off"
+        required
+      />
+      <button type="submit" id="submit-btn">Resolve</button>
+    </form>
+
+    <div class="trace" id="trace">
+      <div class="empty">// dán một link đã rút gọn ở trên rồi nhấn Resolve</div>
+    </div>
+
+    <div class="result hidden" id="result">
+      <div class="label" id="result-label">Destination</div>
+      <div class="dest-row">
+        <div class="dest" id="dest-text"></div>
+        <button type="button" class="copy-btn" id="copy-btn">Copy</button>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const form = document.getElementById('form');
+    const urlInput = document.getElementById('url-input');
+    const submitBtn = document.getElementById('submit-btn');
+    const trace = document.getElementById('trace');
+    const result = document.getElementById('result');
+    const resultLabel = document.getElementById('result-label');
+    const destText = document.getElementById('dest-text');
+    const copyBtn = document.getElementById('copy-btn');
+    const hostsLabel = document.getElementById('hosts-label');
+
+    fetch('/api/health')
+      .then((r) => r.json())
+      .then((data) => {
+        if (Array.isArray(data.hosts) && data.hosts.length) {
+          const uniqueRoots = [...new Set(data.hosts.map((h) => h.replace(/^www\./, '')))];
+          hostsLabel.textContent = uniqueRoots.join(', ');
+        }
+      })
+      .catch(() => {});
+
+    function renderTrace(logs, ok) {
+      trace.innerHTML = '';
+      if (!logs || !logs.length) {
+        trace.innerHTML = '<div class="empty">// không có log</div>';
+        return;
+      }
+      logs.forEach((line, i) => {
+        const row = document.createElement('div');
+        row.className = 'hop' + (!ok && i === logs.length - 1 ? ' error' : '');
+        const n = document.createElement('span');
+        n.className = 'n';
+        n.textContent = String(i + 1).padStart(2, '0');
+        const text = document.createElement('span');
+        text.textContent = line.replace(/^\[[^\]]+\]\s*/, '');
+        row.appendChild(n);
+        row.appendChild(text);
+        trace.appendChild(row);
+      });
+      trace.scrollTop = trace.scrollHeight;
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const url = urlInput.value.trim();
+      if (!url) return;
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Resolving…';
+      result.classList.add('hidden');
+      result.classList.remove('error');
+      trace.innerHTML = '<div class="empty">// đang gửi yêu cầu...</div>';
+
+      try {
+        const res = await fetch('/api/bypass', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+        const data = await res.json();
+        renderTrace(data.logs, data.success);
+
+        result.classList.remove('hidden');
+        if (data.success) {
+          resultLabel.textContent = 'Destination';
+          destText.textContent = data.destination;
+        } else {
+          result.classList.add('error');
+          resultLabel.textContent = 'Không thể resolve';
+          destText.textContent = data.reason || 'Lỗi không xác định';
+        }
+      } catch (err) {
+        renderTrace([`Lỗi mạng: ${err.message}`], false);
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Resolve';
+      }
+    });
+
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(destText.textContent);
+        copyBtn.textContent = 'Copied';
+        setTimeout(() => (copyBtn.textContent = 'Copy'), 1200);
+      } catch {
+        /* clipboard unavailable */
+      }
+    });
+  </script>
+</body>
+</html>
