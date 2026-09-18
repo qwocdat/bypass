@@ -85,7 +85,7 @@
 
   .trace{
     padding: 14px 16px;
-    min-height: 64px;
+    min-height: 80px;
     max-height: 260px;
     overflow-y: auto;
     color: var(--muted);
@@ -94,6 +94,7 @@
   .trace .hop{ display: flex; gap: 10px; }
   .trace .hop .n{ color: var(--amber); width: 18px; flex-shrink: 0; text-align: right; }
   .trace .hop.error .n{ color: var(--danger); }
+  .trace .hop.error .text{ color: var(--danger); }
   .trace .empty{ color: var(--muted); }
 
   .result{
@@ -112,6 +113,7 @@
     padding: 10px 12px;
   }
   .result.error .label{ color: var(--danger); }
+  .result.error .dest{ color: var(--danger); border-color: rgba(224,92,92,0.3); }
   .result.hidden{ display: none; }
 
   .copy-btn{ border-color: #1f4c47; color: var(--teal); }
@@ -128,14 +130,14 @@
     <div class="titlebar">
       <span class="dot"></span><span class="dot"></span><span class="dot"></span>
       <span class="path">link-bypass</span>
-      <span class="hosts" id="hosts-label"></span>
+      <span class="hosts" id="hosts-label">link4m.com, link4m.org...</span>
     </div>
 
     <form class="input-row" id="form">
       <input
         type="url"
         id="url-input"
-        placeholder="https://link4m.com/..."
+        placeholder="https://link4m.org/..."
         autocomplete="off"
         required
       />
@@ -143,7 +145,7 @@
     </form>
 
     <div class="trace" id="trace">
-      <div class="empty">// dán một link đã rút gọn ở trên rồi nhấn Resolve</div>
+      <div class="empty">// Dán một link rút gọn ở trên rồi nhấn Resolve</div>
     </div>
 
     <div class="result hidden" id="result">
@@ -156,6 +158,12 @@
   </main>
 
   <script>
+    // Nếu bạn deploy Backend tách biệt (Render), hãy thay thế URL dưới đây bằng URL Render của bạn
+    // Ví dụ: const API_BASE_URL = 'https://link-bypass-backend.onrender.com';
+    const API_BASE_URL = window.location.origin.includes('localhost') 
+      ? 'http://localhost:3000' 
+      : window.location.origin;
+
     const form = document.getElementById('form');
     const urlInput = document.getElementById('url-input');
     const submitBtn = document.getElementById('submit-btn');
@@ -166,7 +174,8 @@
     const copyBtn = document.getElementById('copy-btn');
     const hostsLabel = document.getElementById('hosts-label');
 
-    fetch('/api/health')
+    // Tải danh sách host hỗ trợ
+    fetch(`${API_BASE_URL}/api/health`)
       .then((r) => r.json())
       .then((data) => {
         if (Array.isArray(data.hosts) && data.hosts.length) {
@@ -179,17 +188,22 @@
     function renderTrace(logs, ok) {
       trace.innerHTML = '';
       if (!logs || !logs.length) {
-        trace.innerHTML = '<div class="empty">// không có log</div>';
+        trace.innerHTML = '<div class="empty">// Không có dữ liệu log</div>';
         return;
       }
       logs.forEach((line, i) => {
         const row = document.createElement('div');
-        row.className = 'hop' + (!ok && i === logs.length - 1 ? ' error' : '');
+        const isErr = !ok && i === logs.length - 1;
+        row.className = 'hop' + (isErr ? ' error' : '');
+        
         const n = document.createElement('span');
         n.className = 'n';
         n.textContent = String(i + 1).padStart(2, '0');
+        
         const text = document.createElement('span');
+        text.className = 'text';
         text.textContent = line.replace(/^\[[^\]]+\]\s*/, '');
+        
         row.appendChild(n);
         row.appendChild(text);
         trace.appendChild(row);
@@ -206,28 +220,62 @@
       submitBtn.textContent = 'Resolving…';
       result.classList.add('hidden');
       result.classList.remove('error');
-      trace.innerHTML = '<div class="empty">// đang gửi yêu cầu...</div>';
+      
+      const startLogs = [`[${new Date().toLocaleTimeString()}] Đang gửi yêu cầu tới máy lưu trữ...`];
+      renderTrace(startLogs, true);
+
+      // Cấu hình Timeout 35 giây (đủ cho Render Free khởi động)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 35000);
 
       try {
-        const res = await fetch('/api/bypass', {
+        const res = await fetch(`${API_BASE_URL}/api/bypass`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url }),
+          signal: controller.signal,
         });
-        const data = await res.json();
-        renderTrace(data.logs, data.success);
+
+        clearTimeout(timeoutId);
+
+        let data;
+        try {
+          data = await res.json();
+        } catch (parseErr) {
+          throw new Error(`Máy chủ phản hồi định dạng không hợp lệ (Mã HTTP ${res.status}).`);
+        }
+
+        const logs = data.logs || startLogs;
+        renderTrace(logs, data.success);
 
         result.classList.remove('hidden');
         if (data.success) {
-          resultLabel.textContent = 'Destination';
+          resultLabel.textContent = 'Destination URL';
           destText.textContent = data.destination;
+          copyBtn.style.display = 'block';
         } else {
           result.classList.add('error');
-          resultLabel.textContent = 'Không thể resolve';
-          destText.textContent = data.reason || 'Lỗi không xác định';
+          resultLabel.textContent = 'Kết quả xử lý';
+          destText.textContent = data.reason || 'Không thể giải mã liên kết này.';
+          copyBtn.style.display = 'none';
         }
+
       } catch (err) {
-        renderTrace([`Lỗi mạng: ${err.message}`], false);
+        clearTimeout(timeoutId);
+        result.classList.remove('hidden');
+        result.classList.add('error');
+        resultLabel.textContent = 'Lỗi truy vấn';
+        copyBtn.style.display = 'none';
+
+        let errMsg = err.message;
+        if (err.name === 'AbortError') {
+          errMsg = 'Hết thời gian chờ (Timeout). Máy chủ backend có thể đang khởi động lại, vui lòng bấm Resolve lần nữa.';
+        } else if (err.message.includes('Failed to fetch')) {
+          errMsg = 'Không thể kết nối đến máy chủ Backend (Lỗi mạng hoặc sai đường dẫn API_BASE_URL).';
+        }
+
+        destText.textContent = errMsg;
+        renderTrace([`[${new Date().toLocaleTimeString()}] LỖI NGHIÊM TRỌNG: ${errMsg}`], false);
       } finally {
         submitBtn.disabled = false;
         submitBtn.textContent = 'Resolve';
@@ -240,7 +288,7 @@
         copyBtn.textContent = 'Copied';
         setTimeout(() => (copyBtn.textContent = 'Copy'), 1200);
       } catch {
-        /* clipboard unavailable */
+        /* Clipboard không sẵn sàng */
       }
     });
   </script>
