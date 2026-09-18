@@ -3,22 +3,22 @@
  * Node.js + Express
  *
  * Nhiệm vụ:
- *  - Nhận URL từ frontend qua POST /api/bypass
- *  - Kiểm tra URL (chỉ HTTP/HTTPS, chặn SSRF: localhost, private IP, metadata IP)
- *  - Gửi HTTP request có timeout + giới hạn kích thước response
- *  - Theo dõi redirect chain (manual redirect)
- *  - Trả về URL đích nếu xác định được
- *  - Nếu gặp cơ chế xác minh (JS challenge, cookie, captcha...) → báo rõ không thể bypass
+ * - Nhận URL từ frontend qua POST /api/bypass
+ * - Kiểm tra URL (chỉ HTTP/HTTPS, chặn SSRF: localhost, private IP, metadata IP)
+ * - Gửi HTTP request có timeout + giới hạn kích thước response
+ * - Theo dõi redirect chain (manual redirect)
+ * - Trả về URL đích nếu xác định được
+ * - Nếu gặp cơ chế xác minh (JS challenge, cookie, captcha...) → báo rõ không thể bypass
  *
  * LƯU Ý: Backend này KHÔNG giải CAPTCHA, KHÔNG đánh cắp cookie/session,
  * KHÔNG giả lập kết quả. Nó chỉ thực hiện các bước HTTP hợp lệ.
  *
- * v2.0 — Production-ready:
- *   - Helmet security headers, CORS whitelist, rate limiting
- *   - Toàn bộ tham số cấu hình qua biến môi trường (.env)
- *   - Structured JSON logging, request IDs
- *   - Graceful shutdown, health/readiness endpoints
- *   - Handler registry vẫn dễ mở rộng thêm shortener khác
+ * v2.1 — Production-ready (Fixed Domain Matching & Base64 Extractor):
+ * - Helmet security headers, CORS whitelist, rate limiting
+ * - Toàn bộ tham số cấu hình qua biến môi trường (.env)
+ * - Structured JSON logging, request IDs
+ * - Graceful shutdown, health/readiness endpoints
+ * - Handler registry vẫn dễ mở rộng thêm shortener khác
  */
 
 require('dotenv').config();
@@ -65,6 +65,7 @@ app.use(helmet());
 app.use(
   cors({
     origin: CONFIG.ALLOWED_ORIGINS.includes('*') ? true : CONFIG.ALLOWED_ORIGINS,
+    credentials: true,
   })
 );
 app.use(express.json({ limit: '16kb' }));
@@ -99,8 +100,7 @@ const bypassLimiter = rateLimit({
 
 /* =========================================================
  * DANH SÁCH SHORTENER HỖ TRỢ
- * Link4m có nhiều TLD: .com, .net, .co, .org
- * Thêm domain mới ở đây khi muốn mở rộng (linkvertise, ouo, adfoc.us...)
+ * Link4m hỗ trợ linh hoạt các TLD thông qua Regex
  * ========================================================= */
 const SUPPORTED_HOSTS = {
   'link4m.com': 'link4m',
@@ -111,12 +111,9 @@ const SUPPORTED_HOSTS = {
   'www.link4m.net': 'link4m',
   'www.link4m.co': 'link4m',
   'www.link4m.org': 'link4m',
-  // Ví dụ mở rộng tương lai:
-  // 'linkvertise.com': 'linkvertise',
-  // 'ouo.io': 'ouo',
-  // 'adfoc.us': 'adfocus',
 };
 
+// FIX 1: Regex bắt chuẩn mọi subdomain & TLD của Link4m
 const LINK4M_HOST_REGEX = /(^|\.)link4m\.(com|net|co|org)$/i;
 
 /* =========================================================
@@ -239,7 +236,7 @@ async function safeFetch(url, { method = 'GET', redirect = 'manual' } = {}) {
 }
 
 /* =========================================================
- * PHÂN TÍCH TRANG LINK4M
+ * PHÂN TÍCH TRANG LINK4M (FIX 2: Thêm quét Base64 & Query Target)
  * ========================================================= */
 function extractCandidateDestination(html, baseUrl) {
   if (!html || typeof html !== 'string') return null;
@@ -264,6 +261,19 @@ function extractCandidateDestination(html, baseUrl) {
   ];
   for (const re of jsPatterns) {
     for (const m of html.matchAll(re)) candidates.push(m[1]);
+  }
+
+  // Quét các chuỗi Base64 URL nhúng trực tiếp trong Javascript/HTML
+  const base64Matches = html.matchAll(/aHR0cHM6Ly[a-zA-Z0-9+/=]+/g);
+  for (const m of base64Matches) {
+    try {
+      const decoded = Buffer.from(m[0], 'base64').toString('utf-8');
+      if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+        candidates.push(decoded);
+      }
+    } catch {
+      /* ignore */
+    }
   }
 
   const anchorMatches = html.matchAll(/<a[^>]+href=["']([^"']+)["']/gi);
@@ -407,9 +417,6 @@ async function link4mHandler(parsedUrl, log) {
  * ========================================================= */
 const HANDLERS = {
   link4m: link4mHandler,
-  // linkvertise: linkvertiseHandler,
-  // ouo: ouoHandler,
-  // adfocus: adfocusHandler,
 };
 
 /* =========================================================
@@ -429,16 +436,19 @@ app.post('/api/bypass', bypassLimiter, async (req, res) => {
     const parsed = validateUrl(url);
     log(`URL hợp lệ: ${parsed.toString()}`);
 
-    const hostname = parsed.hostname.replace(/^www\./, '').toLowerCase();
-    const handlerKey = SUPPORTED_HOSTS[parsed.hostname] || SUPPORTED_HOSTS[hostname];
+    const hostname = parsed.hostname.toLowerCase();
+    
+    // FIX 3: Tìm Handler theo Regex nếu không khớp cứng trong SUPPORTED_HOSTS
+    let handlerKey = SUPPORTED_HOSTS[hostname] || SUPPORTED_HOSTS[hostname.replace(/^www\./, '')];
+    if (!handlerKey && LINK4M_HOST_REGEX.test(hostname)) {
+      handlerKey = 'link4m';
+    }
 
     if (!handlerKey) {
       log(`Domain không được hỗ trợ: ${parsed.hostname}`);
       return res.status(400).json({
         success: false,
-        reason: `Domain "${parsed.hostname}" chưa được hỗ trợ. Hiện hỗ trợ: ${Object.keys(
-          SUPPORTED_HOSTS
-        ).join(', ')}`,
+        reason: `Domain "${parsed.hostname}" chưa được hỗ trợ.`,
         logs,
       });
     }
@@ -469,7 +479,7 @@ app.get('/api/version', (_req, res) => {
   res.json({ name: pkg.name, version: pkg.version });
 });
 
-// 404 fallback for unknown API routes
+// 404 fallback cho API routes
 app.use('/api', (_req, res) => {
   res.status(404).json({ success: false, reason: 'Không tìm thấy endpoint' });
 });
